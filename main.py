@@ -2,15 +2,13 @@ import asyncio
 import atexit
 import logging
 from logging import config
-import os
 import signal
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import yaml
-import adafruit_dht
-import board
+import dht11
 import paho.mqtt.client as mqtt
 from telegram import Update
 from telegram.ext import (
@@ -20,10 +18,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from time import sleep
 
 import RPi.GPIO as GPIO
 
-DHT_SENSOR_TYPE = adafruit_dht.DHT11
 
 # =============================================================================
 # LOGGING SETUP
@@ -34,6 +32,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # =============================================================================
 # CONFIGURATION
@@ -71,27 +73,27 @@ class Config:
             sys.exit(1)
 
         gpio = cfg.get("gpio", {})
-        self.dht_pin = gpio.get('dht_pin', 4)
-        self.relay_pin = gpio.get('cfg.relay_pin', 17)
-        self.relay_active_low = gpio.get('relay_active_low', True)
+        self.dht_pin = int(gpio.get('dht_pin', 4))
+        self.relay_pin = int(gpio.get('cfg.relay_pin', 17))
+        self.relay_active_low = bool(gpio.get('relay_active_low', True))
 
         mqtt_cfg = cfg.get('mqtt', {})
-        self.mqtt_enabled = mqtt_cfg.get('enabled', True)
-        self.mqtt_broker = mqtt_cfg.get('broker', 'localhost')
-        self.mqtt_port = mqtt_cfg.get('port', 1883)
-        self.mqtt_reconnect_interval = mqtt_cfg.get('reconnect_interval', 30)
+        self.mqtt_enabled = bool(mqtt_cfg.get('enabled', True))
+        self.mqtt_broker = str(mqtt_cfg.get('broker', 'localhost'))
+        self.mqtt_port = int(mqtt_cfg.get('port', 1883))
+        self.mqtt_reconnect_interval = int(mqtt_cfg.get('reconnect_interval', 30))
         
         topics = mqtt_cfg.get('topics', {})
         self.mqtt_topic_temperature = topics.get('temperature', 'thermostat/temperature')
         self.mqtt_topic_humidity = topics.get('humidity', 'thermostat/humidity')
-        self.relay_pin = topics.get('heating', 'thermostat/heating')
+        self.mqtt_topic_heating = topics.get('heating', 'thermostat/heating')
         self.mqtt_topic_target = topics.get('target', 'thermostat/target')
         
         control = cfg.get('control', {})
-        self.measurement_interval = control.get('measurement_interval', 60)
-        self.temperature_hysteresis = control.get('temperature_hysteresis', 0.5)
-        self.min_temperature = control.get('min_temperature', 10)
-        self.max_temperature = control.get('max_temperature', 23)
+        self.measurement_interval = int(control.get('measurement_interval', 60))
+        self.temperature_hysteresis = float(control.get('temperature_hysteresis', 0.5))
+        self.min_temperature = float(control.get('min_temperature', 10))
+        self.max_temperature = float(control.get('max_temperature', 23))
         
         logger.info(f"Configuration loaded from {self.config_path}")
 
@@ -178,18 +180,39 @@ def cleanup_gpio():
 # =============================================================================
 
 def setup_sensor():
+    """Initialize the DHT11 sensor."""
     global dht_sensor
+    if GPIO is None:
+        logger.warning("GPIO not available - sensor will not work")
+        dht_sensor = None
+        return
+    
     try:
-        dht_sensor = DHT_SENSOR_TYPE(cfg.dht_pin)
-        logger.info("DHT sensor initialized")
+        dht_sensor = dht11.DHT11(pin=cfg.dht_pin)
+        logger.info(f"DHT11 sensor initialized on GPIO{cfg.dht_pin}")
+        
+        sleep(2)
+        
+        for i in range(3):
+            result = dht_sensor.read()
+            if result.is_valid():
+                logger.info(f"Sensor ready: {result.temperature}°C, {result.humidity}%")
+                state.temperature = float(result.temperature)
+                state.humidity = float(result.humidity)
+                state.sensor_error = None
+                return
+            sleep(2)
+        
+        logger.warning("Sensor initialized but initial readings invalid (will retry in main loop)")
+        
     except Exception as e:
-        logger.error(f"Failed to initialize DHT sensor: {e}")
+        logger.error(f"Failed to initialize DHT11 sensor: {e}")
         dht_sensor = None
 
 
 def read_sensor() -> tuple[Optional[float], Optional[float]]:
     """
-    Read temperature and humidity from the DHT sensor.
+    Read temperature and humidity from the DHT11 sensor.
     Returns (temperature, humidity) or (None, None) on error.
     """
     global dht_sensor
@@ -199,14 +222,18 @@ def read_sensor() -> tuple[Optional[float], Optional[float]]:
         return None, None
     
     try:
-        temperature = dht_sensor.temperature
-        humidity = dht_sensor.humidity
-        state.sensor_error = None
-        return temperature, humidity
-    except RuntimeError as e:
-        state.sensor_error = str(e)
-        logger.warning(f"Sensor read error (will retry): {e}")
-        return None, None
+        result = dht_sensor.read()
+        
+        if result.is_valid():
+            temperature = float(result.temperature)
+            humidity = float(result.humidity)
+            state.sensor_error = None
+            return temperature, humidity
+        else:
+            state.sensor_error = f"Invalid reading (error code: {result.error_code})"
+            logger.debug(f"Sensor read invalid: error code {result.error_code}")
+            return None, None
+            
     except Exception as e:
         state.sensor_error = str(e)
         logger.error(f"Unexpected sensor error: {e}")
@@ -298,7 +325,7 @@ def update_heating_state():
         if state.heating_on:
             state.heating_on = False
             turn_off_relay()
-            publish_mqtt(cfg.relay_pin, "OFF")
+            publish_mqtt(cfg.mqtt_topic_heating, "OFF")
         return
     
     if state.temperature is None:
@@ -306,7 +333,7 @@ def update_heating_state():
             logger.warning("No temperature reading - turning off heating for safety")
             state.heating_on = False
             turn_off_relay()
-            publish_mqtt(cfg.relay_pin, "OFF")
+            publish_mqtt(cfg.mqtt_topic_heating, "OFF")
         return
     
     lower_threshold = state.target_temperature - cfg.temperature_hysteresis
@@ -315,12 +342,12 @@ def update_heating_state():
     if state.temperature < lower_threshold and not state.heating_on:
         state.heating_on = True
         turn_on_relay()
-        publish_mqtt(cfg.relay_pin, "ON")
+        publish_mqtt(cfg.mqtt_topic_heating, "ON")
         logger.info(f"Heating ON (temp {state.temperature}°C < {lower_threshold}°C)")
     elif state.temperature > upper_threshold and state.heating_on:
         state.heating_on = False
         turn_off_relay()
-        publish_mqtt(cfg.relay_pin, "OFF")
+        publish_mqtt(cfg.mqtt_topic_heating, "OFF")
         logger.info(f"Heating OFF (temp {state.temperature}°C > {upper_threshold}°C)")
 
 
@@ -401,11 +428,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_auth(update):
-        return
-    
+async def make_status():
     # Temperature reading
     if state.temperature is not None:
         temp_str = f"{state.temperature:.1f}°C"
@@ -448,11 +471,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         time_str = "Never"
     
-    # Sensor error
-    error_str = ""
-    if state.sensor_error:
-        error_str = f"\n⚠️ Sensor: {state.sensor_error}"
-    
     status_text = f"""📊 *Thermostat Status*
 
 🌡️ Temperature: {temp_str}
@@ -463,8 +481,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔥 Heating: {heating_str}
 
 📡 MQTT: {mqtt_str}
-🕐 Last reading: {time_str}{error_str}
+🕐 Last reading: {time_str}
 """
+    
+    return status_text
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update):
+        return
+    
+    status_text = await make_status()
     await update.message.reply_text(status_text, parse_mode="Markdown")
 
 
@@ -519,7 +545,7 @@ async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.heating_on = False
     turn_off_relay()
     
-    publish_mqtt(cfg.relay_pin, "OFF")
+    publish_mqtt(cfg.mqtt_topic_heating, "OFF")
     
     await update.message.reply_text(
         "✅ Temperature control disabled.\n"
@@ -547,6 +573,29 @@ def signal_handler(signum, frame):
 # =============================================================================
 # MAIN
 # =============================================================================
+
+async def send_startup_message(application: Application):
+    """Send a startup notification to all authorized users."""
+
+    read_sensor()
+    startup_text = (
+        "🟢 *Thermostat Bot Started*\n\n"
+        f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"    
+        "Use /help for available commands.\nControl is currently disabled."
+    )
+    startup_text += "\n"
+    startup_text += await make_status()
+    
+    for user_id in cfg.allowed_user_ids:
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text=startup_text,
+                parse_mode="Markdown"
+            )
+            logger.info(f"Startup message sent to user {user_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send startup message to user {user_id}: {e}")
 
 async def main():
     """Main entry point."""
@@ -594,6 +643,8 @@ async def main():
     await application.start()
     await application.updater.start_polling(drop_pending_updates=True)
     
+    await send_startup_message(application)
+
     logger.info("Bot is running. Press Ctrl+C to stop.")
     
     # Keep running until interrupted
