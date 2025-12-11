@@ -1,7 +1,6 @@
 import asyncio
 import atexit
 import logging
-from logging import config
 import signal
 import sys
 from datetime import datetime
@@ -429,6 +428,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 async def make_status():
+    read_sensor()
     # Temperature reading
     if state.temperature is not None:
         temp_str = f"{state.temperature:.1f}°C"
@@ -577,7 +577,6 @@ def signal_handler(signum, frame):
 async def send_startup_message(application: Application):
     """Send a startup notification to all authorized users."""
 
-    read_sensor()
     startup_text = (
         "🟢 *Thermostat Bot Started*\n\n"
         f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"    
