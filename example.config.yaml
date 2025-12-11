@@ -1,0 +1,29 @@
+telegram:
+  bot_token: "BOT_TOKEN"
+  allowed_user_ids:
+    - 123456789
+    - 987654321
+
+# GPIO Pin Configuration
+gpio:
+  dht_pin: 4              # GPIO pin for DHT sensor data
+  relay_pin: 17           # GPIO pin for relay control
+
+# MQTT Configuration
+mqtt:
+  enabled: true
+  broker: "localhost"
+  port: 1883
+  reconnect_interval: 30  # Seconds between reconnection attempts
+  topics:
+    temperature: "home/thermostat/temperature"
+    humidity: "home/thermostat/humidity"
+    heating: "home/thermostat/heating"
+    target: "home/thermostat/target"
+
+# Control Configuration
+control:
+  measurement_interval: 60    # Seconds between sensor readings
+  temperature_hysteresis: 0.5 # Degrees - prevents rapid on/off cycling
+  min_temperature: 5          # Minimum allowed target temperature
+  max_temperature: 35         # Maximum allowed target temperature
