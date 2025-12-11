@@ -1,0 +1,6 @@
+PyYAML>=6.0
+python-telegram-bot>=22.0
+paho-mqtt>=2.0.0
+adafruit-circuitpython-dht>=4.0.0
+RPi.GPIO>=0.7.0
+adafruit-blinka>=8.0.0
