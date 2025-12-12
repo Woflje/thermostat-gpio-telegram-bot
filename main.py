@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import json
 import logging
 import signal
 import sys
@@ -73,7 +74,7 @@ class Config:
 
         gpio = cfg.get("gpio", {})
         self.dht_pin = int(gpio.get('dht_pin', 4))
-        self.relay_pin = int(gpio.get('cfg.relay_pin', 17))
+        self.relay_pin = int(gpio.get('relay_pin', 17))
         self.relay_active_low = bool(gpio.get('relay_active_low', True))
 
         mqtt_cfg = cfg.get('mqtt', {})
@@ -81,12 +82,8 @@ class Config:
         self.mqtt_broker = str(mqtt_cfg.get('broker', 'localhost'))
         self.mqtt_port = int(mqtt_cfg.get('port', 1883))
         self.mqtt_reconnect_interval = int(mqtt_cfg.get('reconnect_interval', 30))
-        
-        topics = mqtt_cfg.get('topics', {})
-        self.mqtt_topic_temperature = topics.get('temperature', 'thermostat/temperature')
-        self.mqtt_topic_humidity = topics.get('humidity', 'thermostat/humidity')
-        self.mqtt_topic_heating = topics.get('heating', 'thermostat/heating')
-        self.mqtt_topic_target = topics.get('target', 'thermostat/target')
+        self.mqtt_topic = str(mqtt_cfg.get('topic', 'thermostat'))
+        self.mqtt_metric_prefix = str(mqtt_cfg.get('metric_prefix', 'thermostat'))
         
         control = cfg.get('control', {})
         self.measurement_interval = int(control.get('measurement_interval', 60))
@@ -296,18 +293,40 @@ async def connect_mqtt():
         state.mqtt_connected = False
 
 
-def publish_mqtt(topic: str, payload: str):
-    """Publish a message to MQTT."""
+def publish_mqtt_metrics():
+    """Publish all metrics as JSON to single MQTT topic."""
     if mqtt_client is None or not cfg.mqtt_enabled:
         return
     
     if not state.mqtt_connected:
-        logger.debug(f"MQTT not connected, skipping publish to {topic}")
+        logger.debug("MQTT not connected, skipping publish")
         return
     
+    prefix = cfg.mqtt_metric_prefix
+    
+    # Build metrics dict for mqtt2prom
+    # Each key becomes a separate metric name
+    metrics = {}
+    
+    if state.temperature is not None:
+        metrics[f"{prefix}_temperature"] = state.temperature
+    
+    if state.humidity is not None:
+        metrics[f"{prefix}_humidity"] = state.humidity
+    
+    # Heating status as 0/1 for gauge
+    metrics[f"{prefix}_heating"] = 1 if state.heating_on else 0
+    
+    # Target temperature (0 if not set/disabled)
+    if state.control_enabled and state.target_temperature is not None:
+        metrics[f"{prefix}_target"] = state.target_temperature
+    else:
+        metrics[f"{prefix}_target"] = 0
+    
     try:
-        mqtt_client.publish(topic, payload, qos=1)
-        logger.debug(f"MQTT published: {topic} = {payload}")
+        payload = json.dumps(metrics)
+        mqtt_client.publish(cfg.mqtt_topic, payload, qos=1)
+        logger.debug(f"MQTT published: {cfg.mqtt_topic} = {payload}")
     except Exception as e:
         logger.warning(f"MQTT publish failed: {e}")
 
@@ -324,7 +343,6 @@ def update_heating_state():
         if state.heating_on:
             state.heating_on = False
             turn_off_relay()
-            publish_mqtt(cfg.mqtt_topic_heating, "OFF")
         return
     
     if state.temperature is None:
@@ -332,7 +350,6 @@ def update_heating_state():
             logger.warning("No temperature reading - turning off heating for safety")
             state.heating_on = False
             turn_off_relay()
-            publish_mqtt(cfg.mqtt_topic_heating, "OFF")
         return
     
     lower_threshold = state.target_temperature - cfg.temperature_hysteresis
@@ -341,12 +358,10 @@ def update_heating_state():
     if state.temperature < lower_threshold and not state.heating_on:
         state.heating_on = True
         turn_on_relay()
-        publish_mqtt(cfg.mqtt_topic_heating, "ON")
         logger.info(f"Heating ON (temp {state.temperature}°C < {lower_threshold}°C)")
     elif state.temperature > upper_threshold and state.heating_on:
         state.heating_on = False
         turn_off_relay()
-        publish_mqtt(cfg.mqtt_topic_heating, "OFF")
         logger.info(f"Heating OFF (temp {state.temperature}°C > {upper_threshold}°C)")
 
 
@@ -367,12 +382,12 @@ async def measurement_loop():
                 state.humidity = humidity
                 state.last_measurement = datetime.now()
                 
-                publish_mqtt(cfg.mqtt_topic_temperature, f"{temp:.1f}")
-                publish_mqtt(cfg.mqtt_topic_humidity, f"{humidity:.1f}")
-                
                 logger.info(f"Measurement: {temp:.1f}°C, {humidity:.1f}%")
             
             update_heating_state()
+            
+            # Publish all metrics as single JSON message
+            publish_mqtt_metrics()
             
         except Exception as e:
             logger.error(f"Error in measurement loop: {e}")
@@ -518,9 +533,8 @@ async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.target_temperature = target
         state.control_enabled = True
         
-        publish_mqtt(cfg.mqtt_topic_target, f"{target:.1f}")
-        
         update_heating_state()
+        publish_mqtt_metrics()
         
         heating_status = "🔥 ON" if state.heating_on else "❄️ OFF"
         await update.message.reply_text(
@@ -545,7 +559,7 @@ async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.heating_on = False
     turn_off_relay()
     
-    publish_mqtt(cfg.mqtt_topic_heating, "OFF")
+    publish_mqtt_metrics()
     
     await update.message.reply_text(
         "✅ Temperature control disabled.\n"
