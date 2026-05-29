@@ -1,5 +1,5 @@
 PyYAML>=6.0
 python-telegram-bot>=22.0
 paho-mqtt>=2.0.0
-dht11>=1.0.0
+dht11>=0.1.0
 RPi.GPIO>=0.7.0
