@@ -15,15 +15,12 @@ mqtt:
   broker: "localhost"
   port: 1883
   reconnect_interval: 30  # Seconds between reconnection attempts
-  topics:
-    temperature: "home/thermostat/temperature"
-    humidity: "home/thermostat/humidity"
-    heating: "home/thermostat/heating"
-    target: "home/thermostat/target"
+  topic: "home/thermostat"
+  metric_prefix: "thermostat"
 
 # Control Configuration
 control:
   measurement_interval: 60    # Seconds between sensor readings
   temperature_hysteresis: 0.5 # Degrees - prevents rapid on/off cycling
   min_temperature: 5          # Minimum allowed target temperature
-  max_temperature: 35         # Maximum allowed target temperature
+  max_temperature: 25         # Maximum allowed target temperature
